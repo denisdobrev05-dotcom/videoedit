@@ -1,0 +1,5 @@
+# Зависимости за rife_interpolate.py
+# Външните инструменти ffmpeg/ffprobe и rife-ncnn-vulkan НЕ са Python пакети —
+# виж README.md за тяхната инсталация.
+
+tqdm>=4.65.0
