@@ -322,9 +322,13 @@ def _run_capture(cmd: list[str], label: str) -> str:
     return proc.stdout
 
 
-def _run_ffmpeg_with_progress(cmd: list[str], total: int, desc: str, label: str):
+def _run_ffmpeg_with_progress(
+    cmd: list[str], total: int, desc: str, label: str, progress_cb=None
+):
     """
-    Пуска ffmpeg с '-progress pipe:1' и показва tqdm прогрес по 'frame='.
+    Пуска ffmpeg с '-progress pipe:1' и докладва прогрес по 'frame='.
+    Ако е подаден progress_cb(current, total) — извиква него (за уеб UI),
+    иначе показва tqdm бар (за CLI).
     """
     # Добавяме machine-readable progress към stdout.
     full = cmd + ["-progress", "pipe:1", "-nostats"]
@@ -339,7 +343,9 @@ def _run_ffmpeg_with_progress(cmd: list[str], total: int, desc: str, label: str)
     except FileNotFoundError as exc:
         raise ToolError(f"{label}: командата не е намерена ({cmd[0]}).") from exc
 
-    bar = tqdm(total=total if total > 0 else None, desc=desc, unit="кадър")
+    bar = None
+    if progress_cb is None:
+        bar = tqdm(total=total if total > 0 else None, desc=desc, unit="кадър")
     last = 0
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -347,12 +353,16 @@ def _run_ffmpeg_with_progress(cmd: list[str], total: int, desc: str, label: str)
         if line.startswith("frame="):
             try:
                 cur = int(line.split("=", 1)[1])
-                bar.update(max(0, cur - last))
+                if progress_cb is not None:
+                    progress_cb(cur, total)
+                elif bar is not None:
+                    bar.update(max(0, cur - last))
                 last = cur
             except ValueError:
                 pass
     proc.wait()
-    bar.close()
+    if bar is not None:
+        bar.close()
 
     if proc.returncode != 0:
         stderr = proc.stderr.read() if proc.stderr else ""
@@ -365,7 +375,9 @@ def _run_ffmpeg_with_progress(cmd: list[str], total: int, desc: str, label: str)
 # ---------------------------------------------------------------------------
 # Фази на конвейера
 # ---------------------------------------------------------------------------
-def extract_frames(ffmpeg: str, video: Path, frames_dir: Path, est_total: int):
+def extract_frames(
+    ffmpeg: str, video: Path, frames_dir: Path, est_total: int, progress_cb=None
+):
     """Извлича всички кадри като PNG на диска (фаза 1)."""
     frames_dir.mkdir(parents=True, exist_ok=True)
     pattern = str(frames_dir / "%08d.png")
@@ -379,7 +391,9 @@ def extract_frames(ffmpeg: str, video: Path, frames_dir: Path, est_total: int):
         "passthrough",
         pattern,
     ]
-    _run_ffmpeg_with_progress(cmd, est_total, "Извличане ", "ffmpeg (extract)")
+    _run_ffmpeg_with_progress(
+        cmd, est_total, "Извличане ", "ffmpeg (extract)", progress_cb
+    )
 
     count = len(list(frames_dir.glob("*.png")))
     if count == 0:
@@ -394,6 +408,7 @@ def interpolate_frames(
     out_dir: Path,
     target_count: int,
     uhd: bool,
+    progress_cb=None,
 ):
     """Пуска RIFE върху папката с кадри (фаза 2) с прогрес по брой файлове."""
     import threading
@@ -424,7 +439,7 @@ def interpolate_frames(
         raise ToolError(f"rife-ncnn-vulkan не е намерен ({rife}).") from exc
 
     # RIFE не дава прогрес на stdout, затова следим броя файлове в изхода.
-    bar = tqdm(total=target_count, desc="Интерполация", unit="кадър")
+    bar = tqdm(total=target_count, desc="Интерполация", unit="кадър") if progress_cb is None else None
     stop = False
 
     def monitor():
@@ -435,7 +450,10 @@ def interpolate_frames(
             except OSError:
                 cur = last
             if cur > last:
-                bar.update(cur - last)
+                if progress_cb is not None:
+                    progress_cb(cur, target_count)
+                elif bar is not None:
+                    bar.update(cur - last)
                 last = cur
             time.sleep(0.3)
 
@@ -444,11 +462,14 @@ def interpolate_frames(
     _, stderr = proc.communicate()
     stop = True
     t.join(timeout=1)
-    # Финално подравняване на бара.
+    # Финално подравняване на прогреса.
     final = len(list(out_dir.glob("*.png")))
-    if final > bar.n:
-        bar.update(final - bar.n)
-    bar.close()
+    if progress_cb is not None:
+        progress_cb(final, target_count)
+    elif bar is not None:
+        if final > bar.n:
+            bar.update(final - bar.n)
+        bar.close()
 
     if proc.returncode != 0:
         raise ToolError(
@@ -471,6 +492,7 @@ def encode_video(
     crf: int,
     has_audio: bool,
     total_frames: int,
+    progress_cb=None,
 ):
     """Сглобява кадрите обратно във видео + копира аудиото (фаза 3)."""
     pattern = str(frames_dir / "%08d.png")
@@ -513,7 +535,9 @@ def encode_video(
         cmd += ["-map", "0:v:0"]
 
     cmd.append(str(output))
-    _run_ffmpeg_with_progress(cmd, total_frames, "Кодиране  ", "ffmpeg (encode)")
+    _run_ffmpeg_with_progress(
+        cmd, total_frames, "Кодиране  ", "ffmpeg (encode)", progress_cb
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +567,142 @@ def compute_target(
 
     target_count = round(frame_count * multiplier)
     return out_fps, target_count
+
+
+def resolve_model(rife_path: str, model: str, log=warn) -> str:
+    """
+    Проверява дали моделът съществува; ако не — избира най-новия наличен v4.x
+    (или първия наличен) и връща избрания.
+    """
+    available = list_available_models(rife_path)
+    if available and model not in available:
+        log(f"Моделът '{model}' не е намерен. Налични: {', '.join(available)}")
+        v4 = [m for m in available if m.startswith("rife-v4")]
+        fallback = sorted(v4)[-1] if v4 else available[-1]
+        log(f"Използвам '{fallback}' вместо това.")
+        return fallback
+    return model
+
+
+def probe_nb_frames(ffprobe: str, video: Path, source_fps: float) -> int:
+    """
+    Оценка на броя кадри (за прогрес бара). Опитва stream nb_frames, после
+    duration * fps. Връща 0 ако не успее (тогава барът е без total).
+    """
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames,duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video),
+    ]
+    try:
+        out = _run_capture(cmd, "ffprobe (frames)")
+    except ToolError:
+        return 0
+    nb, duration = 0, 0.0
+    for line in out.splitlines():
+        line = line.strip()
+        if line in ("", "N/A"):
+            continue
+        try:
+            val = float(line)
+        except ValueError:
+            continue
+        # Първата стойност е nb_frames (цяло), втората е duration.
+        if val.is_integer() and nb == 0 and val > 1:
+            nb = int(val)
+        else:
+            duration = val
+    if nb > 0:
+        return nb
+    if duration > 0 and source_fps > 0:
+        return round(duration * source_fps)
+    return 0
+
+
+def run_pipeline(
+    tools: dict,
+    input_path: Path,
+    output_path: Path,
+    *,
+    fps: float | None,
+    multiplier: float | None,
+    model: str,
+    crf: int,
+    uhd: bool,
+    keep_temp: bool,
+    temp_dir: str | None,
+    progress_cb=None,
+    log=info,
+) -> Path:
+    """
+    Целият конвейер: extract -> interpolate -> encode. Преизползва се от CLI
+    и от уеб приложението.
+
+    progress_cb(phase, current, total) — извиква се по време на всяка фаза,
+    където phase е едно от: 'extract', 'interpolate', 'encode'.
+    Връща пътя до изхода. Хвърля ToolError при проблем.
+    """
+    model = resolve_model(tools["rife"], model, log)
+
+    source_fps = probe_fps(tools["ffprobe"], input_path)
+    has_audio = probe_has_audio(tools["ffprobe"], input_path)
+    est_total = probe_nb_frames(tools["ffprobe"], input_path, source_fps)
+    log(f"Входен FPS: {source_fps:.3f} | аудио: {'да' if has_audio else 'не'}")
+
+    base_temp = Path(temp_dir) if temp_dir else None
+    if base_temp:
+        base_temp.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(tempfile.mkdtemp(prefix="rife_", dir=base_temp))
+    frames_in = temp_root / "in"
+    frames_out = temp_root / "out"
+
+    def phase_cb(phase):
+        if progress_cb is None:
+            return None
+        return lambda cur, total: progress_cb(phase, cur, total)
+
+    try:
+        # --- Фаза 1: извличане ---
+        frame_count = extract_frames(
+            tools["ffmpeg"], input_path, frames_in, est_total, phase_cb("extract")
+        )
+        log(f"Извлечени кадри: {frame_count}")
+
+        out_fps, target_count = compute_target(
+            source_fps, frame_count, fps, multiplier
+        )
+        log(
+            f"Изходен FPS: {out_fps:.3f} | целеви кадри: {target_count} "
+            f"(~{target_count / frame_count:.3f}x)"
+        )
+
+        # --- Фаза 2: интерполация ---
+        produced = interpolate_frames(
+            tools["rife"], model, frames_in, frames_out, target_count, uhd,
+            phase_cb("interpolate"),
+        )
+        log(f"Интерполирани кадри: {produced}")
+
+        # --- Фаза 3: кодиране ---
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        encode_video(
+            tools["ffmpeg"], frames_out, input_path, output_path, out_fps,
+            crf, has_audio, produced, phase_cb("encode"),
+        )
+        log(f"Готово! Изход: {output_path}")
+        return output_path
+    finally:
+        if keep_temp:
+            log(f"Временните файлове са запазени в: {temp_root}")
+        else:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -623,94 +783,30 @@ def main(argv: list[str] | None = None) -> int:
     except ToolError as exc:
         die(str(exc))
 
-    # Проверка за модела.
-    available = list_available_models(tools["rife"])
-    if available and args.model not in available:
-        warn(
-            f"Моделът '{args.model}' не е намерен. Налични: {', '.join(available)}"
-        )
-        # Опитваме да изберем най-новия v4.x, иначе първия наличен.
-        v4 = [m for m in available if m.startswith("rife-v4")]
-        fallback = sorted(v4)[-1] if v4 else available[-1]
-        warn(f"Използвам '{fallback}' вместо това.")
-        args.model = fallback
-
-    # Информация за входа.
-    try:
-        source_fps = probe_fps(tools["ffprobe"], input_path)
-        has_audio = probe_has_audio(tools["ffprobe"], input_path)
-    except ToolError as exc:
-        die(str(exc))
-
-    info(f"Входен FPS: {source_fps:.3f}")
-    info(f"Аудио поток: {'да' if has_audio else 'не'}")
-
-    # Временни папки.
-    base_temp = Path(args.temp_dir) if args.temp_dir else None
-    if base_temp:
-        base_temp.mkdir(parents=True, exist_ok=True)
-    temp_root = Path(tempfile.mkdtemp(prefix="rife_", dir=base_temp))
-    frames_in = temp_root / "in"
-    frames_out = temp_root / "out"
-    info(f"Временна папка: {temp_root}")
-
     exit_code = 0
     try:
-        # --- Фаза 1: извличане на кадрите ---
-        # Груба оценка на броя кадри за прогрес бара (точният брой се чете
-        # след извличането).
-        est_total = 0  # tqdm ще е без total ако е 0
-        frame_count = extract_frames(
-            tools["ffmpeg"], input_path, frames_in, est_total
-        )
-        info(f"Извлечени кадри: {frame_count}")
-
-        # --- Изчисление на целта ---
-        out_fps, target_count = compute_target(
-            source_fps, frame_count, args.fps, args.multiplier
-        )
-        info(
-            f"Изходен FPS: {out_fps:.3f} | целеви брой кадри: {target_count} "
-            f"(множител ~{target_count / frame_count:.3f}x)"
-        )
-
-        # --- Фаза 2: интерполация ---
-        produced = interpolate_frames(
-            tools["rife"],
-            args.model,
-            frames_in,
-            frames_out,
-            target_count,
-            args.uhd,
-        )
-        info(f"Интерполирани кадри: {produced}")
-
-        # --- Фаза 3: кодиране ---
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        encode_video(
-            tools["ffmpeg"],
-            frames_out,
+        run_pipeline(
+            tools,
             input_path,
             output_path,
-            out_fps,
-            args.crf,
-            has_audio,
-            produced,
+            fps=args.fps,
+            multiplier=args.multiplier,
+            model=args.model,
+            crf=args.crf,
+            uhd=args.uhd,
+            keep_temp=args.keep_temp,
+            temp_dir=args.temp_dir,
+            progress_cb=None,  # CLI ползва вградените tqdm барове
+            log=info,
         )
-        info(f"Готово! Изход: {output_path}")
-
+        if not args.keep_temp:
+            info("Временните файлове са изчистени.")
     except ToolError as exc:
         print(f"\n[ГРЕШКА] {exc}", file=sys.stderr)
         exit_code = 1
     except KeyboardInterrupt:
         print("\nПрекъснато от потребителя.", file=sys.stderr)
         exit_code = 130
-    finally:
-        if args.keep_temp:
-            info(f"Временните файлове са запазени в: {temp_root}")
-        else:
-            shutil.rmtree(temp_root, ignore_errors=True)
-            info("Временните файлове са изчистени.")
 
     return exit_code
 

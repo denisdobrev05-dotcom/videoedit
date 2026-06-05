@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RIFE — увеличаване на FPS</title>
+  <style>
+    :root {
+      --bg: #0f1220; --card: #1a1f35; --accent: #6c8cff; --accent2: #4cd6b4;
+      --text: #e8ecff; --muted: #9aa3c7; --err: #ff6b6b; --line: #2a3050;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #1c2342, var(--bg));
+      color: var(--text); min-height: 100vh; display: flex;
+      align-items: flex-start; justify-content: center; padding: 40px 16px;
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+      width: 100%; max-width: 560px; padding: 28px 26px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.4);
+    }
+    h1 { margin: 0 0 4px; font-size: 24px; }
+    .sub { color: var(--muted); margin: 0 0 22px; font-size: 14px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px; }
+    input[type=number], select, .drop {
+      width: 100%; background: #11152a; color: var(--text);
+      border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px;
+      font-size: 14px;
+    }
+    .drop {
+      border-style: dashed; text-align: center; cursor: pointer; padding: 26px 12px;
+      transition: .15s; color: var(--muted);
+    }
+    .drop.over { border-color: var(--accent); color: var(--text); background: #161c38; }
+    .drop b { color: var(--accent); }
+    .row { display: flex; gap: 12px; }
+    .row > div { flex: 1; }
+    .seg { display: flex; gap: 8px; margin-top: 6px; }
+    .seg button {
+      flex: 1; padding: 9px; border-radius: 9px; border: 1px solid var(--line);
+      background: #11152a; color: var(--muted); cursor: pointer; font-size: 13px;
+    }
+    .seg button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 14px; }
+    .check input { width: 16px; height: 16px; }
+    button.go {
+      width: 100%; margin-top: 22px; padding: 14px; border: 0; border-radius: 11px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      color: #08111e; font-weight: 700; font-size: 15px; cursor: pointer;
+    }
+    button.go:disabled { opacity: .5; cursor: not-allowed; }
+    .bar-wrap { margin-top: 20px; display: none; }
+    .bar { height: 12px; background: #11152a; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+    .bar > i { display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .3s; }
+    .status { font-size: 13px; color: var(--muted); margin-top: 8px; }
+    .err { color: var(--err); font-size: 13px; margin-top: 14px; white-space: pre-wrap; }
+    .warn-box { background: #2a1f2f; border: 1px solid #5a3a4a; color: #ffc4c4;
+      padding: 12px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; white-space: pre-wrap; }
+    .dl { display: none; margin-top: 18px; text-align: center; }
+    .dl a { display: inline-block; padding: 12px 22px; background: var(--accent2);
+      color: #08111e; border-radius: 10px; text-decoration: none; font-weight: 700; }
+    .small { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🎬 RIFE — повече FPS</h1>
+    <p class="sub">AI интерполация на кадри (не blend). Обработката тече локално на твоя GPU.</p>
+
+    {% if tools_error %}
+    <div class="warn-box"><b>Внимание — липсват инструменти:</b>{{ "\n" }}{{ tools_error }}</div>
+    {% endif %}
+
+    <form id="form">
+      <div class="drop" id="drop">
+        <input type="file" id="file" name="video" accept="video/*" hidden>
+        <span id="dropText">Пусни видео тук или <b>избери файл</b></span>
+      </div>
+
+      <label>Режим</label>
+      <div class="seg">
+        <button type="button" id="mFps" class="active">Целеви FPS</button>
+        <button type="button" id="mMul">Множител</button>
+      </div>
+
+      <div id="fpsBox">
+        <label>Целеви FPS</label>
+        <input type="number" id="fps" value="60" min="1" step="1">
+      </div>
+      <div id="mulBox" style="display:none">
+        <label>Множител (напр. 2 = 2x кадри)</label>
+        <input type="number" id="multiplier" value="2" min="1.1" step="0.5">
+      </div>
+
+      <div class="row">
+        <div>
+          <label>RIFE модел</label>
+          <select id="model">
+            {% for m in models %}
+            <option value="{{ m }}" {% if m == default_model %}selected{% endif %}>{{ m }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Качество (CRF 0–51)</label>
+          <input type="number" id="crf" value="18" min="0" max="51" step="1">
+        </div>
+      </div>
+
+      <label class="check"><input type="checkbox" id="uhd"> UHD режим (за 4K+ видео)</label>
+
+      <button type="submit" class="go" id="go">Стартирай</button>
+    </form>
+
+    <div class="bar-wrap" id="barWrap">
+      <div class="bar"><i id="barFill"></i></div>
+      <div class="status" id="status">Подготовка...</div>
+    </div>
+
+    <div class="err" id="err"></div>
+
+    <div class="dl" id="dlBox">
+      <a id="dlLink" href="#">⬇ Свали резултата</a>
+      <div class="small">Готово! Файлът е запазен и в папка <code>outputs/</code>.</div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let mode = "fps", file = null, polling = null;
+
+    // --- избор на режим ---
+    $("mFps").onclick = () => { mode = "fps"; $("mFps").classList.add("active"); $("mMul").classList.remove("active"); $("fpsBox").style.display = ""; $("mulBox").style.display = "none"; };
+    $("mMul").onclick = () => { mode = "multiplier"; $("mMul").classList.add("active"); $("mFps").classList.remove("active"); $("mulBox").style.display = ""; $("fpsBox").style.display = "none"; };
+
+    // --- drag & drop ---
+    const drop = $("drop");
+    drop.onclick = () => $("file").click();
+    $("file").onchange = (e) => setFile(e.target.files[0]);
+    ["dragover", "dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+    ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+    drop.addEventListener("drop", e => { if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]); });
+    function setFile(f) { file = f; $("dropText").innerHTML = f ? ("✅ " + f.name) : "Пусни видео тук или <b>избери файл</b>"; }
+
+    // --- submit ---
+    $("form").onsubmit = async (e) => {
+      e.preventDefault();
+      $("err").textContent = "";
+      $("dlBox").style.display = "none";
+      if (!file) { $("err").textContent = "Първо избери видео файл."; return; }
+
+      const fd = new FormData();
+      fd.append("video", file);
+      fd.append("mode", mode);
+      fd.append("fps", $("fps").value);
+      fd.append("multiplier", $("multiplier").value);
+      fd.append("model", $("model").value);
+      fd.append("crf", $("crf").value);
+      if ($("uhd").checked) fd.append("uhd", "on");
+
+      $("go").disabled = true;
+      $("barWrap").style.display = "block";
+      $("barFill").style.width = "0%";
+      $("status").textContent = "Качване...";
+
+      let res;
+      try { res = await fetch("/upload", { method: "POST", body: fd }).then(r => r.json()); }
+      catch (err) { fail("Грешка при качване: " + err); return; }
+      if (res.error) { fail(res.error); return; }
+
+      poll(res.job_id);
+    };
+
+    function poll(jobId) {
+      polling = setInterval(async () => {
+        let j;
+        try { j = await fetch("/progress/" + jobId).then(r => r.json()); }
+        catch (e) { return; }
+        if (j.error) { fail(j.error); return; }
+
+        const pct = j.percent || 0;
+        $("barFill").style.width = pct + "%";
+        let label = j.phase_label || "Обработка...";
+        if (j.total) label += ` — ${j.current}/${j.total} кадъра (${pct}%)`;
+        $("status").textContent = label;
+
+        if (j.status === "done") {
+          clearInterval(polling);
+          $("status").textContent = "Готово! 🎉";
+          $("barFill").style.width = "100%";
+          $("dlLink").href = "/download/" + jobId;
+          $("dlBox").style.display = "block";
+          $("go").disabled = false;
+        } else if (j.status === "error") {
+          clearInterval(polling);
+          fail(j.message || "Неизвестна грешка.");
+        }
+      }, 600);
+    }
+
+    function fail(msg) {
+      if (polling) clearInterval(polling);
+      $("err").textContent = msg;
+      $("status").textContent = "Спряно.";
+      $("go").disabled = false;
+    }
+  </script>
+</body>
+</html>
